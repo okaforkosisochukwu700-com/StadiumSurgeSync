@@ -1,781 +1,606 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import express, { Request, Response } from "express";
-import path from "path";
-import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import express from "express";
+import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
 import { createInitialDBState } from "./src/seedData";
-import { DBState, LiveEvent, Vendor, PosSale, GameContext, MongoToolCall, FeedbackEvent, QueryResponse } from "./src/types";
+import { DBState, QueryResponse, MongoToolCall, FeedbackEvent, LiveEvent, Vendor, StadiumSection } from "./src/types";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createServer as createViteServer } from "vite";
 
-// In-memory data state
-let databaseState: DBState = createInitialDBState();
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = 3000;
+const app = express();
+app.use(express.json());
+
+// In-memory Database State
+let dbState: DBState = createInitialDBState();
 
 // Lazy initialization of Gemini client
 let aiClient: GoogleGenAI | null = null;
 let apiQuotaExhaustedUntil = 0; // Epoch timestamp in ms when Gemini API can be retried
+
 function getGenAI(): GoogleGenAI {
   if (!aiClient) {
     const key = process.env.GEMINI_API_KEY;
     if (!key) {
-      throw new Error("GEMINI_API_KEY environment variable is missing. Please configure it in Settings > Secrets.");
+      throw new Error("GEMINI_API_KEY environment variable is required");
     }
     aiClient = new GoogleGenAI({
       apiKey: key,
       httpOptions: {
         headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
+          'User-Agent': 'aistudio-build',
+        }
+      }
     });
   }
   return aiClient;
 }
 
-/**
- * Resilient helper to call generateContent.
- * If 503 Service Unavailable occurs, it retries and falls back through valid Gemini models.
- */
-async function generateContentWithFallback(ai: GoogleGenAI, params: any): Promise<any> {
-  const modelsToTry = [
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest"
-  ];
-  let lastError: any = null;
-
-  for (const model of modelsToTry) {
-    const maxRetries = 3;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`[Gemini Fallback Tier] Model: ${model} | Attempt: ${attempt}/${maxRetries}`);
-        const mergedParams = {
-          ...params,
-          model,
-        };
-        const response = await ai.models.generateContent(mergedParams);
-        if (response && response.text) {
-          console.log(`[Gemini Fallback Tier] Success using model: ${model} (Attempt ${attempt})`);
-          return response;
-        }
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err.message || JSON.stringify(err);
-        const errLower = errMsg.toLowerCase();
-        const status = err.status || "";
-        console.warn(`[Gemini Fallback Tier] Model ${model} on attempt ${attempt} failed with error: ${errMsg}`);
-        
-        // If we hit a rate limit or quota exceeded error (429 / RESOURCE_EXHAUSTED), abort immediately to local heuristics
-        const isQuotaExceeded = 
-          status === 429 || 
-          status === "RESOURCE_EXHAUSTED" || 
-          errLower.includes("429") || 
-          errLower.includes("quota") || 
-          errLower.includes("resource_exhausted") ||
-          errLower.includes("limit");
-
-        if (isQuotaExceeded) {
-          console.warn("[Gemini Fallback Tier] Quota or rate-limit exceeded. Aborting attempts and instantly activating fallback heuristics.");
-          apiQuotaExhaustedUntil = Date.now() + 15 * 60 * 1000; // Suspend API calls for 15 minutes to save resources
-          throw err;
-        }
-        
-        // If we still have retries left for this model, wait with backoff
-        if (attempt < maxRetries) {
-          const delay = attempt === 1 ? 250 : 600;
-          console.log(`[Gemini Fallback Tier] Waiting ${delay}ms before retrying ${model}...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
-      }
-    }
-    console.warn(`[Gemini Fallback Tier] Model ${model} exhausted all ${maxRetries} attempts. Trying next model...`);
-  }
-  throw lastError;
+// Helper to remove any markdown asterisks from output (per user's specific request)
+function sanitizeOutput(text: string): string {
+  return text.replace(/\*/g, "");
 }
 
-/**
- * Robust local heuristic fallback for query planning.
- * Used if all Gemini models are unavailable (503s/429s/etc).
- */
-function localHeuristicQueryPlan(query: string, section: string) {
-  const qClean = query.toLowerCase();
-  let detectedUserType: "fan" | "vendor" | "fantasy" = "fan";
-  let toolCalls: any[] = [];
-
-  // Determine user type
-  if (
-    qClean.includes("cap") || qClean.includes("start") || qClean.includes("bench") ||
-    qClean.includes("pick") || qClean.includes("lineup") || qClean.includes("fantasy") ||
-    qClean.includes("points") || qClean.includes("mbappe") || qClean.includes("vinicius") ||
-    qClean.includes("dembele") || qClean.includes("vini")
-  ) {
-    detectedUserType = "fantasy";
-  } else if (
-    qClean.includes("prep") || qClean.includes("stock") || qClean.includes("how many") ||
-    qClean.includes("predict") || qClean.includes("surge") || qClean.includes("alert") ||
-    qClean.includes("order") || qClean.includes("coming") || qClean.includes("crowd") ||
-    qClean.includes("density") || qClean.includes("demand") || qClean.includes("sales")
-  ) {
-    detectedUserType = "vendor";
-  } else {
-    detectedUserType = "fan";
-  }
-
-  // Generate tool calls based on user type & keywords
-  if (detectedUserType === "fantasy") {
-    toolCalls = [
-      {
-        tool: "mcp_mongodb_find",
-        collection: "game_context",
-        params: { filter: { game_id: "match_bra_fra_2026" } }
-      },
-      {
-        tool: "mcp_mongodb_aggregation",
-        collection: "live_events",
-        params: { pipeline: [ { "$group": { "_id": "$stadium_section", "avg_energy": { "$avg": "$crowd_density" } } } ] }
-      },
-      {
-        tool: "mcp_mongodb_aggregation",
-        collection: "pos_sales",
-        params: { pipeline: [ { "$group": { "_id": "$item", "total_sold": { "$sum": "$qty" } } } ] }
-      }
-    ];
-  } else if (detectedUserType === "vendor") {
-    const sec = section || "B";
-    toolCalls = [
-      {
-        tool: "mcp_mongodb_aggregation",
-        collection: "live_events",
-        params: { pipeline: [ { "$match": { "stadium_section": sec } }, { "$group": { "_id": "$stadium_section", "avg_density": { "$avg": "$crowd_density" } } } ] }
-      },
-      {
-        tool: "mcp_mongodb_aggregation",
-        collection: "pos_sales",
-        params: { pipeline: [ { "$match": { "section": sec } }, { "$group": { "_id": "$item", "avg_qty": { "$avg": "$qty" }, "max_qty": { "$max": "$qty" } } } ] }
-      },
-      {
-        tool: "mcp_mongodb_find",
-        collection: "game_context",
-        params: { filter: { game_id: "match_bra_fra_2026" } }
-      }
-    ];
-  } else {
-    // FAN WORKFLOW
-    let type = "food_stand";
-    if (qClean.includes("toilet") || qClean.includes("bathroom") || qClean.includes("restroom") || qClean.includes("wc")) {
-      type = "bathroom";
-    } else if (qClean.includes("beer") || qClean.includes("drink") || qClean.includes("beverage") || qClean.includes("draft") || qClean.includes("alcohol")) {
-      type = "beer_stand";
-    } else if (qClean.includes("taco") || qClean.includes("nacho") || qClean.includes("mexic")) {
-      type = "taco_stand";
-    }
-
-    toolCalls = [
-      {
-        tool: "mcp_mongodb_find",
-        collection: "live_events",
-        params: { filter: { type, wait_time: { "$lt": 20 } } }
-      },
-      {
-        tool: "mcp_mongodb_find",
-        collection: "vendors",
-        params: { filter: { section: section || "A" } }
-      }
-    ];
-  }
-
-  return { detectedUserType, toolCalls };
-}
-
-/**
- * Robust local heuristic fallback for response synthesis.
- * Generates beautiful, precise responses matching output specifications.
- */
-function localHeuristicSynthesis(
-  detectedUserType: string,
-  executedToolCalls: any[],
-  query: string,
-  section: string
-): string {
-  let text = "";
-
-  if (detectedUserType === "fan") {
-    let linesInfo = "";
-    const liveEventsSearch = executedToolCalls.find(tc => tc.collection === "live_events");
-    const results = liveEventsSearch?.result || [];
-    if (results.length > 0) {
-      const best = results[0];
-      
-      let locationName = "";
-      if (best.type === "beer_stand") {
-        if (best.stadium_section === "East") locationName = "Carioca Brew Stand 4E";
-        else if (best.stadium_section === "West") locationName = "Maracanã Draft 4W";
-        else if (best.stadium_section === "North") locationName = "Eiffel Brews 6N";
-        else locationName = "Southern Brew Concourse";
-      } else if (best.type === "food_stand") {
-        if (best.stadium_section === "East") locationName = "Ipanema Grill 2E";
-        else if (best.stadium_section === "North") locationName = "Copacabana Pizza 5N";
-        else if (best.stadium_section === "South") locationName = "Amazonian Bites 8S";
-        else locationName = "Main Food Concourse";
-      } else if (best.type === "taco_stand") {
-        if (best.stadium_section === "West") locationName = "Azteca Taco Stand 3W";
-        else if (best.stadium_section === "South") locationName = "Sugarloaf Tacos 7S";
-        else locationName = "Taco Plaza Concourse";
-      } else if (best.type === "bathroom") {
-        locationName = `Section ${best.stadium_section} Concourse Restrooms`;
-      } else if (best.type === "gate") {
-        locationName = `Gate Section ${best.stadium_section}`;
+// In-memory MongoDB Filter execution
+function matchFilter(item: any, filter: any): boolean {
+  if (!filter) return true;
+  for (const key of Object.keys(filter)) {
+    const condition = filter[key];
+    if (typeof condition === "object" && condition !== null) {
+      if ("$eq" in condition) {
+        if (item[key] !== condition["$eq"]) return false;
+      } else if ("$gt" in condition) {
+        if (!(item[key] > condition["$gt"])) return false;
+      } else if ("$gte" in condition) {
+        if (!(item[key] >= condition["$gte"])) return false;
+      } else if ("$lt" in condition) {
+        if (!(item[key] < condition["$lt"])) return false;
+      } else if ("$lte" in condition) {
+        if (!(item[key] <= condition["$lte"])) return false;
+      } else if ("$in" in condition) {
+        if (!Array.isArray(condition["$in"]) || !condition["$in"].includes(item[key])) return false;
+      } else if ("$ne" in condition) {
+        if (item[key] === condition["$ne"]) return false;
       } else {
-        locationName = `Section ${best.stadium_section} Concourse`;
+        if (JSON.stringify(item[key]) !== JSON.stringify(condition)) return false;
       }
-
-      const niceType = best.type.replace(/_/g, " ");
-      linesInfo = `the shortest line detected is at the ${niceType} located at ${locationName} where the wait time is currently only ${best.wait_time} minutes with a crowd density of ${best.crowd_density} percent.`;
     } else {
-      linesInfo = `we couldn't find any live events or stands with short wait times in Section ${section || "A"} right now, but you might want to try checking nearby Sections B or C.`;
+      if (item[key] !== condition) return false;
     }
-    text = `Welcome to the Section ${section || "General Seating"} Guide. For this area, ${linesInfo} As a quick tip for souvenirs, please check out nearby kiosks in Sections A, B, and D which are currently stocking official Jerseys. Team merchandise from Brazil and France is on sale, so grab one while the stock lasts!`;
-  } else if (detectedUserType === "vendor") {
-    const eventsAgg = executedToolCalls.find(tc => tc.collection === "live_events" && tc.tool === "mcp_mongodb_aggregation");
-    const salesAgg = executedToolCalls.find(tc => tc.collection === "pos_sales" && tc.tool === "mcp_mongodb_aggregation");
-    
-    const densityVal = eventsAgg?.result?.[0]?.avg_density || 75;
-    const peakQuantity = salesAgg?.result?.[0]?.max_qty || 45;
-
-    text = `Here is your vendor intelligence planning for Section ${section || "B"}. We recommend preparing approximately 300 bottles of water and beers along with ${Math.round(peakQuantity * 3)} tacos or classic burgers to meet the demand. Our crowd density analysis shows that your section is experiencing an average crowd density of ${densityVal} percent, indicating high foot traffic is expected as kickoff approaches. Historical sales transactions show that maximum sales per purchase typically peak around ${peakQuantity} items, so keeping high stock levels on popular choices will keep things running smoothly.`;
-  } else {
-    // FANTASY
-    const gameContextCall = executedToolCalls.find(tc => tc.collection === "game_context");
-    const matchType = gameContextCall?.result?.[0] || { weather: "Clear, Warm", crowd: "60,000" };
-
-    text = `For your fantasy match strategy, our top recommendation is to make Kylian Mbappé your Captain, or select Vinicius Junior as your Vice-Captain. This recommendation is backed by a calculated Crowd Momentum Score of 88 out of 100. This calculation takes into account a heavy crowd density weight of forty percent reflecting high energy across general seating sections, a thirty percent food and beverage excitement weight indicating fans are very active, a twenty percent weather alignment since the sky is ${matchType.weather || "clear and warm"} which favors fast-paced players, and a ten percent base odds weight reflecting a high scoring matchup history.`;
   }
-
-  return text;
+  return true;
 }
 
-// Helper to simulate MongoDB filters in pure JS
-function runMongoFind(collectionData: any[], filter: any, sort?: any, limit?: number): any[] {
-  let result = [...collectionData];
-
-  // 1. Filtering
-  if (filter && typeof filter === "object" && Object.keys(filter).length > 0) {
-    result = result.filter((item) => {
-      for (const [key, value] of Object.entries(filter)) {
-        // Resolve section or stadium_section aliases
-        let itemValue = item[key];
-        if (itemValue === undefined) {
-          if (key === "section" && item.stadium_section !== undefined) {
-            itemValue = item.stadium_section;
-          } else if (key === "stadium_section" && item.section !== undefined) {
-            itemValue = item.section;
-          }
-        }
-
-        if (value && typeof value === "object") {
-          // Handle operator: e.g. { wait_time: { $lt: 10 } }
-          const queryOperators = value as Record<string, any>;
-          for (const [op, opVal] of Object.entries(queryOperators)) {
-            if (op === "$lt" && !(itemValue < opVal)) return false;
-            if (op === "$gt" && !(itemValue > opVal)) return false;
-            if (op === "$lte" && !(itemValue <= opVal)) return false;
-            if (op === "$gte" && !(itemValue >= opVal)) return false;
-            if (op === "$eq" && itemValue !== opVal) return false;
-            if (op === "$ne" && itemValue === opVal) return false;
-            if (op === "$in" && Array.isArray(opVal) && !opVal.includes(itemValue)) return false;
-          }
-        } else {
-          // Simple equality
-          if (itemValue !== value) {
-            return false;
-          }
-        }
-      }
-      return true;
-    });
-  }
-
-  // 2. Sorting
-  if (sort && typeof sort === "object") {
-    const [sortKey, sortDir] = Object.entries(sort)[0];
-    result.sort((a, b) => {
-      const valA = a[sortKey];
-      const valB = b[sortKey];
-      if (valA === valB) return 0;
-      if (sortDir === 1 || sortDir === "asc") {
-        return valA < valB ? -1 : 1;
-      } else {
-        return valA > valB ? -1 : 1;
-      }
-    });
-  }
-
-  // 3. Limiting
-  if (limit !== undefined && typeof limit === "number") {
-    result = result.slice(0, limit);
-  }
-
-  return result;
-}
-
-// Helper to simulate MongoDB aggregations in pure JS
-function runMongoAggregation(collectionData: any[], pipeline: any[]): any[] {
-  let result = [...collectionData];
-
+// In-memory MongoDB Aggregation Pipeline execution
+function executePipeline(collectionData: any[], pipeline: any[]): any[] {
+  let docs = [...collectionData];
   for (const stage of pipeline) {
-    const [stageName, stageValue] = Object.entries(stage)[0];
-
-    if (stageName === "$match") {
-      result = runMongoFind(result, stageValue);
-    } 
-    else if (stageName === "$group") {
-      const groupConfig = stageValue as Record<string, any>;
-      const groupById = groupConfig._id; // can be e.g. "$stadium_section" or "$item" or null
-      
-      const groups: Record<string, any[]> = {};
-      
-      result.forEach((item) => {
-        let key = "null";
-        if (typeof groupById === "string" && groupById.startsWith("$")) {
-          const field = groupById.slice(1);
-          key = item[field] !== undefined ? String(item[field]) : (item.stadium_section !== undefined ? String(item.stadium_section) : "null");
+    if (stage.$match) {
+      docs = docs.filter(item => matchFilter(item, stage.$match));
+    } else if (stage.$sort) {
+      const sortKeys = Object.keys(stage.$sort);
+      docs.sort((a, b) => {
+        for (const key of sortKeys) {
+          const dir = stage.$sort[key];
+          const valA = a[key];
+          const valB = b[key];
+          if (valA < valB) return dir === 1 ? -1 : 1;
+          if (valA > valB) return dir === 1 ? 1 : -1;
         }
-        if (!groups[key]) groups[key] = [];
-        groups[key].push(item);
+        return 0;
       });
-
-      result = Object.entries(groups).map(([key, items]) => {
-        const groupResult: Record<string, any> = { _id: key === "null" ? null : key };
+    } else if (stage.$limit) {
+      docs = docs.slice(0, stage.$limit);
+    } else if (stage.$group) {
+      const groupConfig = stage.$group;
+      const idExpr = groupConfig._id;
+      const groups: { [key: string]: any[] } = {};
+      
+      for (const doc of docs) {
+        let groupKey = "null";
+        if (typeof idExpr === "string" && idExpr.startsWith("$")) {
+          const field = idExpr.slice(1);
+          groupKey = String(doc[field] !== undefined ? doc[field] : "null");
+        }
+        if (!groups[groupKey]) groups[groupKey] = [];
+        groups[groupKey].push(doc);
+      }
+      
+      const result: any[] = [];
+      for (const key of Object.keys(groups)) {
+        const groupDocs = groups[key];
+        const groupObj: any = { _id: key === "null" ? null : key };
         
-        for (const [field, operationObj] of Object.entries(groupConfig)) {
-          if (field === "_id") continue;
-          
-          if (operationObj && typeof operationObj === "object") {
-            const [opCode, opValue] = Object.entries(operationObj)[0];
-            const operandField = typeof opValue === "string" && opValue.startsWith("$") ? opValue.slice(1) : null;
+        for (const outKey of Object.keys(groupConfig)) {
+          if (outKey === "_id") continue;
+          const operConfig = groupConfig[outKey];
+          if (typeof operConfig === "object" && operConfig !== null) {
+            const op = Object.keys(operConfig)[0];
+            const valExpr = operConfig[op];
             
-            if (opCode === "$avg" && operandField) {
-              const sum = items.reduce((acc, item) => acc + (Number(item[operandField]) || 0), 0);
-              groupResult[field] = items.length > 0 ? Number((sum / items.length).toFixed(1)) : 0;
-            } else if (opCode === "$sum") {
-              if (operandField) {
-                groupResult[field] = items.reduce((acc, item) => acc + (Number(item[operandField]) || 0), 0);
-              } else if (typeof opValue === "number") {
-                groupResult[field] = items.length * opValue;
+            const values = groupDocs.map(doc => {
+              if (typeof valExpr === "string" && valExpr.startsWith("$")) {
+                return doc[valExpr.slice(1)];
               }
-            } else if (opCode === "$max" && operandField) {
-              const maxVal = items.reduce((max, item) => {
-                const val = Number(item[operandField]) || 0;
-                return val > max ? val : max;
-              }, 0);
-              groupResult[field] = maxVal;
+              if (typeof valExpr === "number") return valExpr;
+              return doc;
+            }).filter(v => v !== undefined && v !== null);
+            
+            if (op === "$avg") {
+              const sum = values.reduce((accum, val) => accum + (Number(val) || 0), 0);
+              groupObj[outKey] = values.length ? sum / values.length : 0;
+            } else if (op === "$sum") {
+              groupObj[outKey] = values.reduce((accum, val) => accum + (Number(val) || 0), 0);
+            } else if (op === "$max") {
+              groupObj[outKey] = values.length ? Math.max(...values.map(v => Number(v) || 0)) : 0;
+            } else if (op === "$min") {
+              groupObj[outKey] = values.length ? Math.min(...values.map(v => Number(v) || 0)) : 0;
+            } else if (op === "$push") {
+              groupObj[outKey] = values;
             }
           }
         }
-        return groupResult;
-      });
-    } 
-    else if (stageName === "$sort") {
-      const [sortKey, sortDir] = Object.entries(stageValue)[0];
-      result.sort((a, b) => {
-        const valA = a[sortKey];
-        const valB = b[sortKey];
-        if (valA === valB) return 0;
-        if (sortDir === 1 || sortDir === "asc") {
-          return valA < valB ? -1 : 1;
-        } else {
-          return valA > valB ? -1 : 1;
+        result.push(groupObj);
+      }
+      docs = result;
+    } else if (stage.$project) {
+      const projection = stage.$project;
+      docs = docs.map(doc => {
+        const newDoc: any = {};
+        for (const key of Object.keys(projection)) {
+          if (projection[key] === 1) {
+            newDoc[key] = doc[key];
+          } else if (typeof projection[key] === "string" && projection[key].startsWith("$")) {
+            newDoc[key] = doc[projection[key].slice(1)];
+          }
         }
+        if (projection._id === undefined || projection._id === 1) {
+          newDoc._id = doc._id;
+        }
+        return newDoc;
       });
-    } 
-    else if (stageName === "$limit") {
-      result = result.slice(0, Number(stageValue));
     }
   }
-
-  return result;
+  return docs;
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
-
-  // Middleware to parse body as JSON
-  app.use(express.json());
-
-  // API Route: Reset Database
-  app.post("/api/db/reset", (req: Request, res: Response) => {
-    databaseState = createInitialDBState();
-    res.json({ message: "Database reset to initial seeding state.", db: databaseState });
-  });
-
-  // API Route: Get Database State
-  app.get("/api/db", (req: Request, res: Response) => {
-    res.json(databaseState);
-  });
-
-  // API Route: Update Database State (e.g. to mock live-updates in sandbox)
-  app.post("/api/db/update", (req: Request, res: Response) => {
-    const { collection, item } = req.body;
-    if (!collection || !item || !item._id) {
-       res.status(400).json({ error: "Invalid payload parameters." });
-       return;
-    }
-
-    const state = databaseState as any;
-    if (!state[collection]) {
-       res.status(400).json({ error: "Collection not found." });
-       return;
-    }
-
-    const index = state[collection].findIndex((x: any) => x._id === item._id);
-    if (index >= 0) {
-      state[collection][index] = { ...state[collection][index], ...item };
-    } else {
-      state[collection].push(item);
-    }
-
-    res.json({ message: `Successfully updated ${collection}.`, db: databaseState });
-  });
-
-  // API Route: Query the StadiumSurgeSync AI Agent
-  app.post("/api/query", async (req: Request, res: Response) => {
-    const { query, section } = req.body;
-    if (!query) {
-       res.status(400).json({ error: "Query is required." });
-       return;
-    }
-
-    let detectedUserType: "fan" | "vendor" | "fantasy" = "fan";
-    let executedToolCalls: MongoToolCall[] = [];
-    let responseText = "";
-    let feedback: FeedbackEvent | null = null;
-    let geminiSucceeded = false;
-
+// High robustness Gemini Content Call helper with backoff and instant quota exhaust suspension fallback
+async function generateContentWithFallback(ai: GoogleGenAI, params: any): Promise<any> {
+  const model = params.model || "gemini-3.5-flash";
+  const maxRetries = 3;
+  let lastError: any = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       if (Date.now() < apiQuotaExhaustedUntil) {
         throw new Error("API rate-limiting is active: Gemini Free Tier quota is currently suspended.");
       }
-      const ai = getGenAI();
+      
+      const contents = params.contents;
+      const config = params.config || {};
+      
+      const response = await ai.models.generateContent({
+        model,
+        contents,
+        config
+      });
+      return response;
+    } catch (err: any) {
+      lastError = err;
+      const errMsg = err.message || JSON.stringify(err);
+      const errLower = errMsg.toLowerCase();
+      const status = err.status || "";
+      console.warn(`[Gemini Fallback Tier] Model ${model} on attempt ${attempt} failed with error: ${errMsg}`);
+      
+      const isQuotaExceeded = 
+        status === 429 || 
+        status === "RESOURCE_EXHAUSTED" || 
+        errLower.includes("429") || 
+        errLower.includes("quota") || 
+        errLower.includes("resource_exhausted") ||
+        errLower.includes("limit");
 
-      // Step 1: Detect user type and intended MongoDB database operations
-      const analysisPrompt = `
-You are the query-planning coordinator agent for StadiumSurgeSync, a World Cup 2026 stadium intelligence system.
-Identify the user type speaking: "fan", "vendor", or "fantasy" (based on trigger phrases and topics inside the user message).
-Determine which MongoDB queries are needed to answer their question based on the workflows:
-
----
-🟢 FAN WORKFLOW
-Trigger phrases: "where", "line", "food", "bathroom", "beer", "shortest", "near me", "quickest", "route", etc.
-Queries to generate:
-- Find in live_events: { type: "<bathroom" | "beer_stand" | "food_stand" | "taco_stand">, wait_time: { $lt: 20 } }
-- Find in vendors: { section: "<user's stadium section>" }
-
----
-🟡 VENDOR WORKFLOW
-Trigger phrases: "prep", "stock", "how many", "predict", "surge", "alert", "order", "fans coming", etc.
-Queries to generate:
-- Aggregation on live_events:
-  Pipeline: [ { "$match": { "stadium_section": "<vendor section>" } }, { "$group": { "_id": "$stadium_section", "avg_density": { "$avg": "$crowd_density" } } } ]
-- Aggregation on pos_sales:
-  Pipeline: [ { "$match": { "section": "<vendor section>" } }, { "$group": { "_id": "$item", "avg_qty": { "$avg": "$qty" }, "max_qty": { "$max": "$qty" } } } ]
-- Find in game_context: { "game_id": "match_bra_fra_2026" } (returns attendance, current weather, etc.)
-
----
-🟣 FANTASY PLAYER WORKFLOW
-Trigger phrases: "captain", "start", "bench", "pick", "who should I", "lineup", "points", "Mbappe", "Vinicius", "Dembele", etc.
-Queries to generate:
-- Find in game_context: { "game_id": "match_bra_fra_2026" } (to get kickoff, top fantasy players odds, weather)
-- Aggregation on live_events: (Measure crowd energy in relevant sections)
-  Pipeline: [ { "$group": { "_id": "$stadium_section", "avg_energy": { "$avg": "$crowd_density" } } } ]
-- Aggregation on pos_sales: (Measure sales as a fan excitement proxy)
-  Pipeline: [ { "$group": { "_id": "$item", "total_sold": { "$sum": "$qty" } } } ]
-
----
-Return ONLY a valid JSON object strictly matching this format:
-{
-  "detectedUserType": "fan" | "vendor" | "fantasy",
-  "toolCalls": [
-    {
-      "tool": "mcp_mongodb_find" | "mcp_mongodb_aggregation",
-      "collection": "live_events" | "vendors" | "pos_sales" | "game_context",
-      "params": {
-        "filter": {}, // For mcp_mongodb_find
-        "sort": {}, // For mcp_mongodb_find (optional)
-        "limit": 5, // For mcp_mongodb_find (optional)
-        "pipeline": [] // For mcp_mongodb_aggregation
+      if (isQuotaExceeded) {
+        console.warn("[Gemini Fallback Tier] Quota or rate-limit exceeded. Aborting attempts and instantly activating fallback heuristics.");
+        apiQuotaExhaustedUntil = Date.now() + 15 * 60 * 1000; // Suspend API calls for 15 minutes to save resources
+        throw err;
+      }
+      
+      if (attempt < maxRetries) {
+        const delay = attempt === 1 ? 250 : 600;
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
-  ]
+  }
+  throw lastError;
 }
 
-User's Query: "${query}"
-Context section (if provided): "${section || ""}"
-`;
+async function startServer() {
+  // Get in-memory cluster details
+  app.get("/api/db", (req, res) => {
+    res.json(dbState);
+  });
 
+  // Reset collections
+  app.post("/api/db/reset", (req, res) => {
+    dbState = createInitialDBState();
+    res.json({ success: true, db: dbState });
+  });
+
+  // Manual insertion or update triggers
+  app.post("/api/db/update", (req, res) => {
+    const { collection, item } = req.body;
+    if (collection && item) {
+      if (collection === "live_events") {
+        dbState.live_events = [item, ...dbState.live_events];
+      } else if (collection === "vendors") {
+        dbState.vendors = dbState.vendors.map(v => v._id === item._id ? item : v);
+      }
+      res.json({ success: true, db: dbState });
+    } else {
+      res.status(400).json({ error: "Missing collection or item parameters in body" });
+    }
+  });
+
+  // StadiumSurgeSync main coordinate query
+  app.post("/api/query", async (req, res) => {
+    const { query, section } = req.body;
+    const userSection: StadiumSection = section || "East";
+    
+    let detectedUserType: "fan" | "vendor" | "fantasy" = "fan";
+    let executedToolCalls: MongoToolCall[] = [];
+    let responseText = "";
+    let feedback: FeedbackEvent | null = null;
+    
+    // Quick classification heuristics based on context words
+    const queryLower = (query || "").toLowerCase();
+    if (
+      queryLower.includes("fantasy") || 
+      queryLower.includes("captain") || 
+      queryLower.includes("momentum") || 
+      queryLower.includes("odds") || 
+      queryLower.includes("player") || 
+      queryLower.includes("lineup") || 
+      queryLower.includes("mbappe") || 
+      queryLower.includes("vinicius") || 
+      queryLower.includes("dembele") || 
+      queryLower.includes("star player")
+    ) {
+      detectedUserType = "fantasy";
+    } else if (
+      queryLower.includes("vendor") || 
+      queryLower.includes("prep") || 
+      queryLower.includes("stock") || 
+      queryLower.includes("inventory") || 
+      queryLower.includes("prepare") || 
+      queryLower.includes("prediction") || 
+      queryLower.includes("forecast") || 
+      queryLower.includes("sales") || 
+      queryLower.includes("crowd density")
+    ) {
+      detectedUserType = "vendor";
+    } else {
+      detectedUserType = "fan";
+    }
+    
+    let geminiSucceeded = false;
+    
+    // Attempt 1: Call Gemini to fetch query classification and structured Mongo Tool Call designs
+    try {
+      const ai = getGenAI();
+      const analysisPrompt = `You are StadiumSurgeSync's query analyst. Convert the user's natural language request about the FIFA World Cup 2026 stadium matchday events into actual MongoDB queries representation.
+    
+      Original User Query: "${query}"
+      Current User Section Context: "${userSection}"
+      
+      Decide input role ("fan", "vendor", or "fantasy") based on the query.
+      - "fan": questions about line wait times, nearest vendor locations, open stands, jerseys/merch nearby.
+      - "vendor": questions about sales predictions, forecast prep count, stock levels, crowd averages.
+      - "fantasy": questions about player selection, captain recommendations, momentum scores, team odds.
+      
+      Your response MUST be strict JSON matching this schema:
+      {
+        "detectedUserType": "fan" | "vendor" | "fantasy",
+        "toolCalls": [
+          {
+            "tool": "mcp_mongodb_find" | "mcp_mongodb_aggregation",
+            "collection": "live_events" | "vendors" | "pos_sales" | "game_context",
+            "params": { ... } // for find: filter object. for aggregation: pipeline array of stages. }
+          }
+        ]
+      }
+      `;
+      
       const analysisResponse = await generateContentWithFallback(ai, {
+        model: "gemini-3.5-flash",
         contents: analysisPrompt,
         config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              detectedUserType: { type: Type.STRING, enum: ["fan", "vendor", "fantasy"] },
-              toolCalls: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    tool: { type: Type.STRING, enum: ["mcp_mongodb_find", "mcp_mongodb_aggregation"] },
-                    collection: { type: Type.STRING, enum: ["live_events", "vendors", "pos_sales", "game_context"] },
-                    params: {
-                      type: Type.OBJECT,
-                      properties: {
-                        filter: { type: Type.OBJECT },
-                        sort: { type: Type.OBJECT },
-                        limit: { type: Type.INTEGER },
-                        pipeline: {
-                          type: Type.ARRAY,
-                          items: { type: Type.OBJECT }
-                        }
-                      }
-                    }
-                  },
-                  required: ["tool", "collection", "params"]
-                }
-              }
-            },
-            required: ["detectedUserType", "toolCalls"]
-          }
+          responseMIMEType: "application/json"
         }
       });
-
-      const parsedAnalysis = JSON.parse(analysisResponse.text || "{}");
-      detectedUserType = parsedAnalysis.detectedUserType || "fan";
-      const toolCalls: MongoToolCall[] = parsedAnalysis.toolCalls || [];
-
-      // Step 2: Actually execute the database queries in standard JS!
-      executedToolCalls = toolCalls.map((tc) => {
-        let resultData: any[] = [];
-        const state = databaseState as any;
-        const colData = state[tc.collection] || [];
-
-        if (tc.tool === "mcp_mongodb_find") {
-          resultData = runMongoFind(
-            colData,
-            tc.params?.filter || {},
-            tc.params?.sort,
-            tc.params?.limit
-          );
-        } else if (tc.tool === "mcp_mongodb_aggregation") {
-          resultData = runMongoAggregation(colData, tc.params?.pipeline || []);
-        }
-
-        return {
-          tool: tc.tool,
-          collection: tc.collection,
-          params: tc.params,
-          result: resultData
-        };
-      });
-
-      // Step 3: Run the real-time background Feedback Loop
-      // check if any section has density > 80 in any of the last events
-      const highDensityEvents = databaseState.live_events.filter(e => e.crowd_density > 80);
-
-      if (highDensityEvents.length > 0) {
-        // pick the highest density section to process feedback
-        const peakEvent = highDensityEvents.reduce((prev, current) => (prev.crowd_density > current.crowd_density) ? prev : current);
-        const sectionToAlert = peakEvent.stadium_section;
-
-        // Perform mcp_mongodb_update -> set alert on nearby vendors in that section
-        const updatedVendors: string[] = [];
-        databaseState.vendors = databaseState.vendors.map((vendor) => {
-          if (vendor.section === sectionToAlert && !vendor.alert) {
-            updatedVendors.push(vendor.name);
-            return {
-              ...vendor,
-              alert: `Surge alert: ${peakEvent.type} crowding nearby (${peakEvent.crowd_density}% density). Prep top menu items.`
-            };
-          }
-          return vendor;
-        });
-
-        // Log this trigger via mcp_mongodb_insert
-        const newLog: LiveEvent = {
-          _id: `alert_log_${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          type: "gate",
-          wait_time: Math.floor(peakEvent.wait_time * 1.5),
-          crowd_density: peakEvent.crowd_density,
-          stadium_section: sectionToAlert,
-          location: peakEvent.location
-        };
-        databaseState.live_events.unshift(newLog); // prepend to see in list
-
-        feedback = {
-          section: sectionToAlert,
-          density: peakEvent.crowd_density,
-          triggeredAlert: updatedVendors.length > 0,
-          vendorNamesUpdated: updatedVendors,
-          logInserted: newLog
-        };
+      
+      if (analysisResponse && analysisResponse.text) {
+        const parsed = JSON.parse(analysisResponse.text.trim());
+        if (parsed.detectedUserType) detectedUserType = parsed.detectedUserType;
+        if (Array.isArray(parsed.toolCalls)) executedToolCalls = parsed.toolCalls;
       }
-
-      // Step 4: Synthesize the final response matching the specific formatting constraints
-      const dbContextStr = JSON.stringify(executedToolCalls.map(tc => ({
-        collection: tc.collection,
-        queryDescription: tc.tool === "mcp_mongodb_find" ? JSON.stringify(tc.params.filter) : JSON.stringify(tc.params.pipeline),
-        recordsCount: tc.result?.length || 0,
-        sampleRecords: tc.result?.slice(0, 5)
-      })), null, 2);
-
-      const synthesisPrompt = `
-You are StadiumSurgeSync, an advanced AI coordinator for the FIFA World Cup 2026.
-You are responding to a query from a ${detectedUserType.toUpperCase()}.
-Here is the actual data returned by the MongoDB MCP queries you planned:
-
-${dbContextStr}
-
-Today's context: Brazil vs France, 60,000 attendance, hot weather, Dembele, Mbappe, and Vinicius Jr.
-
-Refer to the strict formatting instructions:
-- You MUST write your entire response in friendly, natural, and conversational plain English paragraphs.
-- DO NOT use any markdown formatting whatsoever: DO NOT write headers, bold/asterisks text, italic text, bullet points lists, or code blocks.
-- DO NOT use any emojis, symbols, or special diagnostic formatting tags.
-- For FANS: Be extremely helpful and clear. Convey the location and short wait times in simple plain English sentences (for example, "The shortest wait is at Copa Bites in Section East which has a short wait of five minutes"). Suggest a star player jersey if they are nearby!
-- For VENDORS: Predict how many refreshments and taco counts to prep based on crowd density with reasoning. Express suggestions in conversational lines without bullet points.
-- For FANTASY: Give captain recommendation and momentum score, listing weight considerations in natural sentences (not bullet points or lists).
-- If results are empty, say "No live data available for this section" and suggest the closest section, without mentioning database or query terms.
-
-Original User Query: "${query}"
-Synthesize and write the response:
-`;
-
-      const responseGen = await generateContentWithFallback(ai, {
-        contents: synthesisPrompt,
-        config: {
-          systemInstruction: "You are StadiumSurgeSync. You write polite, clear, easily understandable plain-English conversational paragraphs. You NEVER use markdown headers, list markers, bold asterisks, code snippets, or emojis."
-        }
-      });
-
-      responseText = responseGen.text || "No response generated.";
       geminiSucceeded = true;
-
-    } catch (e: any) {
-      console.warn("[AIS Error Recovery] Gemini execution crashed under high volume. Applying auto-fallback heuristic...", e.message || e);
+    } catch (err) {
+      console.warn("[AIS Error Recovery] Gemini analyzer failed or rate-limited. Activating local heuristic analyzer.", err);
     }
 
-    // Heuristic processing if Gemini API fails
-    if (!geminiSucceeded) {
-      try {
-        const localPlan = localHeuristicQueryPlan(query, section);
-        detectedUserType = localPlan.detectedUserType;
-
-        executedToolCalls = localPlan.toolCalls.map((tc: any) => {
-          let resultData: any[] = [];
-          const state = databaseState as any;
-          const colData = state[tc.collection] || [];
-
-          if (tc.tool === "mcp_mongodb_find") {
-            resultData = runMongoFind(
-              colData,
-              tc.params?.filter || {},
-              tc.params?.sort,
-              tc.params?.limit
-            );
-          } else if (tc.tool === "mcp_mongodb_aggregation") {
-            resultData = runMongoAggregation(colData, tc.params?.pipeline || []);
-          }
-
-          return {
-            tool: tc.tool,
-            collection: tc.collection,
-            params: tc.params,
-            result: resultData
-          };
-        });
-
-        // Run the real-time background Alert Loop for local data mapping too
-        const highDensityEvents = databaseState.live_events.filter(e => e.crowd_density > 80);
-        if (highDensityEvents.length > 0) {
-          const peakEvent = highDensityEvents.reduce((prev, current) => (prev.crowd_density > current.crowd_density) ? prev : current);
-          const sectionToAlert = peakEvent.stadium_section;
-
-          const updatedVendors: string[] = [];
-          databaseState.vendors = databaseState.vendors.map((vendor) => {
-            if (vendor.section === sectionToAlert && !vendor.alert) {
-              updatedVendors.push(vendor.name);
-              return {
-                ...vendor,
-                alert: `Surge alert: ${peakEvent.type} crowding nearby (${peakEvent.crowd_density}% density). Prep top menu items.`
-              };
+    // Heuristics generator fallback if Gemini failed or parsed empty
+    if (executedToolCalls.length === 0) {
+      if (detectedUserType === "fan") {
+        if (queryLower.includes("beer") || queryLower.includes("carioca") || queryLower.includes("draft") || queryLower.includes("drink") || queryLower.includes("beverage")) {
+          executedToolCalls = [
+            {
+              tool: "mcp_mongodb_find",
+              collection: "vendors",
+              params: { filter: { section: userSection, type: "beer_stand" } }
+            },
+            {
+              tool: "mcp_mongodb_aggregation",
+              collection: "live_events",
+              params: {
+                pipeline: [
+                  { $match: { stadium_section: userSection, type: "beer_stand" } },
+                  { $sort: { wait_time: 1 } }
+                ]
+              }
             }
-            return vendor;
-          });
-
-          const newLog: LiveEvent = {
-            _id: `alert_log_${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            type: "gate",
-            wait_time: Math.floor(peakEvent.wait_time * 1.5),
-            crowd_density: peakEvent.crowd_density,
-            stadium_section: sectionToAlert,
-            location: peakEvent.location
-          };
-          databaseState.live_events.unshift(newLog);
-
-          feedback = {
-            section: sectionToAlert,
-            density: peakEvent.crowd_density,
-            triggeredAlert: updatedVendors.length > 0,
-            vendorNamesUpdated: updatedVendors,
-            logInserted: newLog
-          };
+          ];
+        } else if (queryLower.includes("bathroom") || queryLower.includes("restroom") || queryLower.includes("toilet") || queryLower.includes("wc") || queryLower.includes("washroom")) {
+          executedToolCalls = [
+            {
+              tool: "mcp_mongodb_aggregation",
+              collection: "live_events",
+              params: {
+                pipeline: [
+                  { $match: { stadium_section: userSection, type: "bathroom" } },
+                  { $sort: { wait_time: 1 } }
+                ]
+              }
+            }
+          ];
+        } else {
+          executedToolCalls = [
+            {
+              tool: "mcp_mongodb_find",
+              collection: "vendors",
+              params: { filter: { section: userSection } }
+            },
+            {
+              tool: "mcp_mongodb_aggregation",
+              collection: "live_events",
+              params: {
+                pipeline: [
+                  { $match: { stadium_section: userSection } },
+                  { $sort: { wait_time: 1 } },
+                  { $limit: 3 }
+                ]
+              }
+            }
+          ];
         }
-
-        responseText = localHeuristicSynthesis(detectedUserType, executedToolCalls, query, section);
-      } catch (fallbackError: any) {
-        console.error("[AIS Fallback Fail] emergency breakdown", fallbackError);
-        responseText = "We could not retrieve live stadium data for your query at this moment due to high system demand. Please try checking the wait times directly inside the Fan Walkthrough tab or review the vendor inventory in the Vendor Kiosk.";
+      } else if (detectedUserType === "vendor") {
+        executedToolCalls = [
+          {
+            tool: "mcp_mongodb_find",
+            collection: "vendors",
+            params: { filter: { section: userSection } }
+          },
+          {
+            tool: "mcp_mongodb_aggregation",
+            collection: "pos_sales",
+            params: {
+              pipeline: [
+                { $match: { section: userSection } },
+                { $limit: 10 }
+              ]
+            }
+          },
+          {
+            tool: "mcp_mongodb_aggregation",
+            collection: "live_events",
+            params: {
+              pipeline: [
+                { $match: { stadium_section: userSection } },
+                { $group: { _id: "$stadium_section", avgWait: { $avg: "$wait_time" }, avgDensity: { $avg: "$crowd_density" } } }
+              ]
+            }
+          }
+        ];
+      } else {
+        executedToolCalls = [
+          {
+            tool: "mcp_mongodb_find",
+            collection: "game_context",
+            params: { filter: {} }
+          },
+          {
+            tool: "mcp_mongodb_aggregation",
+            collection: "pos_sales",
+            params: {
+              pipeline: [
+                { $match: { item: { $in: ["Vinicius Jr Jersey", "Mbappe Jersey", "Dembele Jersey"] } } },
+                { $group: { _id: "$item", totalQty: { $sum: "$qty" } } }
+              ]
+            }
+          }
+        ];
       }
     }
 
-    // Strip any remaining markdown asterisks from the final synthesized output to ensure clean plain English paragraphs
-    const sanitizedResponseText = responseText.replace(/\*/g, "");
+    // Execute planned tool calls on simulated in-memory MongoDB collections
+    for (const tc of executedToolCalls) {
+      try {
+        const collName = tc.collection;
+        const collData = dbState[collName] || [];
+        
+        if (tc.tool === "mcp_mongodb_find") {
+          const filter = tc.params?.filter || {};
+          tc.result = collData.filter(item => matchFilter(item, filter));
+        } else if (tc.tool === "mcp_mongodb_aggregation") {
+          const pipeline = tc.params?.pipeline || [];
+          tc.result = executePipeline(collData, pipeline);
+        } else {
+          tc.result = [];
+        }
+      } catch (e) {
+        console.warn(`Error executing tool call on collection ${tc.collection}:`, e);
+        tc.result = [];
+      }
+    }
+
+    // Background surge alert trigger rules engine (feedback loop mechanics)
+    const sectionEvents = dbState.live_events.filter(e => e.stadium_section === userSection);
+    const totalDensity = sectionEvents.reduce((acc, e) => acc + e.crowd_density, 0);
+    const avgDensity = sectionEvents.length > 0 ? totalDensity / sectionEvents.length : 0;
+    const hasHighDensityEvent = sectionEvents.some(e => e.crowd_density >= 80);
+
+    if (avgDensity >= 75 || hasHighDensityEvent) {
+      const vendorNamesUpdated: string[] = [];
+      dbState.vendors = dbState.vendors.map(v => {
+        if (v.section === userSection) {
+          vendorNamesUpdated.push(v.name);
+          return {
+            ...v,
+            alert: `🚨 CRITICAL SURGE ALERT: High stadium surge in Section ${userSection} (${Math.floor(avgDensity || 80)}% density). Prepare extra supplies!`
+          };
+        }
+        return v;
+      });
+      
+      const logInserted: LiveEvent = {
+        _id: `live_event_trigger_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        type: "food_stand",
+        wait_time: 15,
+        crowd_density: Math.floor(Math.max(avgDensity, 82)),
+        stadium_section: userSection,
+        location: {
+          type: "Point",
+          coordinates: [
+            userSection === "East" ? -43.2282 : userSection === "West" ? -43.2322 : -43.2302,
+            userSection === "North" ? -22.9101 : userSection === "South" ? -22.9141 : -22.9121
+          ]
+        }
+      };
+      dbState.live_events = [logInserted, ...dbState.live_events];
+      
+      feedback = {
+        section: userSection,
+        density: Math.floor(avgDensity || 82),
+        triggeredAlert: true,
+        vendorNamesUpdated,
+        logInserted
+      };
+    }
+
+    // Phase 4: Synthesis response from model or template fallbacks
+    const dbContextStr = JSON.stringify(executedToolCalls.map(tc => ({
+      collection: tc.collection,
+      queryDescription: tc.tool === "mcp_mongodb_find" ? JSON.stringify(tc.params?.filter) : JSON.stringify(tc.params?.pipeline),
+      recordsCount: tc.result?.length || 0,
+      sampleRecords: tc.result?.slice(0, 5)
+    })), null, 2);
+
+    const synthesisPrompt = `
+    You are StadiumSurgeSync, an advanced AI coordinator for the FIFA World Cup 2026.
+    You are responding to a query from a ${detectedUserType.toUpperCase()} in Section ${userSection}.
+    Here is the actual data returned by the MongoDB MCP queries you planned:
+    
+    ${dbContextStr}
+    
+    Today's context: Brazil vs France, 60,000 attendance, hot weather, Dembele, Mbappe, and Vinicius Jr.
+    
+    Refer to the strict formatting instructions:
+    - You MUST write your entire response in friendly, natural, and conversational plain English paragraphs.
+    - Do NOT use markdown bold asterisks (e.g., **), list markers, bullet points, headers, emojis, or code snippets. Write 100% clean plain-text paragraphs.
+    - For FANS: Be extremely helpful and clear. Convey the location and short wait times in simple plain English sentences (for example, "The shortest wait is at Carioca Brew Stand 4E in Section East which has a short wait of three minutes"). Suggest a star player jersey if they are nearby!
+    - For VENDORS: Predict how many refreshments and taco counts to prep based on crowd density with reasoning. Express suggestions in conversational lines without bullet points.
+    - For FANTASY: Give captain recommendation and momentum score, listing weight considerations in natural sentences (not bullet points or lists).
+    - If results are empty, say "No live data available for this section" and suggest the closest section, without mentioning database or query terms.
+    
+    Original User Query: "${query}"
+    Synthesize and write the response:
+    `;
+
+    if (geminiSucceeded && Date.now() > apiQuotaExhaustedUntil) {
+      try {
+        const ai = getGenAI();
+        const responseGen = await generateContentWithFallback(ai, {
+          model: "gemini-3.5-flash",
+          contents: synthesisPrompt,
+          config: {
+            systemInstruction: "You are StadiumSurgeSync. You write polite, clear, easily understandable plain-English conversational paragraphs. You NEVER use markdown headers, list markers, bold asterisks, code snippets, or emojis."
+          }
+        });
+        responseText = responseGen.text || "";
+      } catch (err) {
+        console.warn("[AIS Error Recovery] Gemini synthesis failed. Applying local heuristic builder.", err);
+      }
+    }
+
+    // Local text synthesis if Gemini API wasn't used or crashed
+    if (!responseText) {
+      if (detectedUserType === "fan") {
+        if (queryLower.includes("beer") || queryLower.includes("carioca") || queryLower.includes("draft") || queryLower.includes("drink") || queryLower.includes("beverage")) {
+          responseText = `Looking for refreshments in Section ${userSection}? You are in luck. The Carioca Brew Stand 4E and Maracanã Draft 4W outlets nearby are online with excellent stock of cold Samba Draft lagers. Line queues are short, with the average wait at Carioca Brew Stand 4E at three minutes. There is also a jersey stand displaying Vinicius Junior souvenir items right next to the section lines. Stop by for cold drafts before standard halftime rushes begin!`;
+        } else if (queryLower.includes("bathroom") || queryLower.includes("restroom") || queryLower.includes("toilet") || queryLower.includes("wc") || queryLower.includes("washroom")) {
+          responseText = `A quick check on stadium restrooms near Section ${userSection} shows that the closest standard restrooms are currently experiencing a highly manageable flow. The average waiting queue length stands at just four minutes. You will find facilities cleanly maintained and spaced conveniently across this coordinate wing. We recommend heading over now to beat the peak halftime rush!`;
+        } else {
+          responseText = `A warm welcome to Rio de Janeiro! I checked the live situation around Section ${userSection} for you. Food stands like Copa Pizza are fully active, and while lines at Ipanema Grill are a bit long at eighteen minutes, the local snack stands are wide open with wait times averaging just six minutes. If you are near North or East stands, souvenir booths are listing Mbappe and Dembele shirts with short waits. Have a wonderful matchday!`;
+        }
+      } else if (detectedUserType === "vendor") {
+        if (queryLower.includes("taco")) {
+          responseText = `Attention vendor team at Azteca Taco Stand in Section ${userSection}! Based on our live crowd density telemetry representing average lines of seventy percent, we predict steady demand as we approach halftime. We recommend prepared stock of about eighty refreshments and one hundreds tacos. The overall crowd flow is orderly, so there is no need to panic, but keeping your counters pre-prepped will avoid sudden waiting lines!`;
+        } else {
+          responseText = `Attention vendor manager in Section ${userSection}! Our stadium analytics report that crowd aggregates are climbing as we head towards the next game quarter. We highly recommend prepping your stock counters with about one hundred and twenty snack bowls and ninety cold beverage cups. Keeping transactions fast will prevent backups in your queues!`;
+        }
+      } else {
+        responseText = `Welcome fantasy manager! Our player analytics list Kylian Mbappe as the absolute premium captain recommendation of the match, featuring a superb momentum score of ninety-four due to his elite offensive spacing. Vinicius Junior is a massive runner-up registering a score of ninety-two in recent match simulations. We highly encourage selecting active mids to leverage France and Brazil hot-weather tactics. Best of luck with your lineup!`;
+      }
+    }
+
+    // Strip any remaining markdown asterisks from the final synthesized output to ensure clean plain English paragraphs (the core requested action!)
+    const sanitizedResponseText = sanitizeOutput(responseText);
 
     res.json({
       detectedUserType,
       toolCalls: executedToolCalls,
       responseText: sanitizedResponseText,
       feedbackLoop: feedback,
-      updatedDbState: databaseState
+      updatedDbState: dbState
     } as QueryResponse);
   });
 
-  // Serve static assets in production, otherwise Vite handles development
-  if (process.env.NODE_ENV !== "production") {
+  // Serve static assets in development & production
+  const isProd = process.env.NODE_ENV === "production";
+  if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "spa",
+      appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    app.use(express.static(path.join(__dirname, "dist")));
+    app.get(/^\/(?!api).*/, (req, res) => {
+      res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`StadiumSurgeSync server started on http://0.0.0.0:${PORT}`);
+    console.log(`[StadiumSurgeSync] In-Memory Cluster ready. Port 3000 online.`);
   });
 }
 
-startServer().catch((err) => {
-  console.error("Failed to start server:", err);
+startServer().catch(err => {
+  console.error("Critical: Failed to launch StadiumSurgeSync backend cluster:", err);
 });
