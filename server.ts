@@ -41,6 +41,37 @@ function getGenAI(): GoogleGenAI {
   return aiClient;
 }
 
+// Pendo server-side Track Event helper
+const PENDO_TRACK_URL = "https://data.pendo.io/data/track";
+const PENDO_INTEGRATION_KEY = "40998916-a56d-4220-bc4e-7e2f5c1efcca";
+
+async function trackPendoEvent(
+  event: string,
+  properties: Record<string, any> = {},
+  visitorId: string = "anonymous",
+  accountId: string = "stadium-demo"
+): Promise<void> {
+  try {
+    await fetch(PENDO_TRACK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-pendo-integration-key": PENDO_INTEGRATION_KEY,
+      },
+      body: JSON.stringify({
+        type: "track",
+        event,
+        visitorId,
+        accountId,
+        timestamp: Date.now(),
+        properties,
+      }),
+    });
+  } catch (err) {
+    console.warn(`[Pendo Track] Failed to send event "${event}":`, err);
+  }
+}
+
 // Helper to remove any markdown asterisks from output (per user's specific request)
 function sanitizeOutput(text: string): string {
   return text.replace(/\*/g, "");
@@ -330,8 +361,19 @@ async function startServer() {
         if (Array.isArray(parsed.toolCalls)) executedToolCalls = parsed.toolCalls;
       }
       geminiSucceeded = true;
-    } catch (err) {
+    } catch (err: any) {
       console.warn("[AIS Error Recovery] Gemini analyzer failed or rate-limited. Activating local heuristic analyzer.", err);
+
+      // Pendo Track Event: Gemini API fallback activated
+      const errMsg = String(err?.message || "Unknown");
+      const isQuota = /quota|429|resource_exhausted|rate.?limit/i.test(errMsg);
+      trackPendoEvent("gemini_api_fallback_activated", {
+        failure_reason: errMsg.substring(0, 200),
+        gemini_model: "gemini-3.5-flash",
+        quota_exhausted_until: apiQuotaExhaustedUntil > Date.now() ? new Date(apiQuotaExhaustedUntil).toISOString() : "",
+        is_quota_exceeded: isQuota,
+        query_text: (query || "").substring(0, 200)
+      });
     }
 
     // Heuristics generator fallback if Gemini failed or parsed empty
@@ -462,6 +504,7 @@ async function startServer() {
     const sectionEvents = dbState.live_events.filter(e => e.stadium_section === userSection);
     const totalDensity = sectionEvents.reduce((acc, e) => acc + e.crowd_density, 0);
     const avgDensity = sectionEvents.length > 0 ? totalDensity / sectionEvents.length : 0;
+    const avgWaitTime = sectionEvents.length > 0 ? sectionEvents.reduce((acc, e) => acc + e.wait_time, 0) / sectionEvents.length : 0;
     const hasHighDensityEvent = sectionEvents.some(e => e.crowd_density >= 80);
 
     if (avgDensity >= 75 || hasHighDensityEvent) {
@@ -501,6 +544,16 @@ async function startServer() {
         vendorNamesUpdated,
         logInserted
       };
+
+      // Pendo Track Event: Crowd surge alert triggered
+      trackPendoEvent("crowd_surge_alert_triggered", {
+        stadium_section: userSection,
+        avg_density: Math.floor(avgDensity),
+        has_high_density_event: hasHighDensityEvent,
+        vendors_updated_count: vendorNamesUpdated.length,
+        vendor_names_updated: vendorNamesUpdated.join(", ").substring(0, 200),
+        trigger_event_id: logInserted._id
+      });
     }
 
     // Phase 4: Synthesis response from model or template fallbacks
@@ -571,6 +624,44 @@ async function startServer() {
 
     // Strip any remaining markdown asterisks from the final synthesized output to ensure clean plain English paragraphs (the core requested action!)
     const sanitizedResponseText = sanitizeOutput(responseText);
+
+    // Pendo Track Events: Result-type-specific tracking
+    const toolCallResultsCount = executedToolCalls.reduce((sum, tc) => sum + (tc.result?.length || 0), 0);
+
+    if (detectedUserType === "fan") {
+      let querySubtype = "general";
+      if (queryLower.includes("beer") || queryLower.includes("drink") || queryLower.includes("beverage") || queryLower.includes("carioca") || queryLower.includes("draft")) {
+        querySubtype = "beverage";
+      } else if (queryLower.includes("bathroom") || queryLower.includes("restroom") || queryLower.includes("toilet") || queryLower.includes("wc") || queryLower.includes("washroom")) {
+        querySubtype = "restroom";
+      }
+      trackPendoEvent("fan_navigation_result_generated", {
+        stadium_section: userSection,
+        query_text: (query || "").substring(0, 200),
+        query_subtype: querySubtype,
+        tool_calls_count: executedToolCalls.length,
+        results_count: toolCallResultsCount,
+        gemini_succeeded: geminiSucceeded
+      });
+    } else if (detectedUserType === "vendor") {
+      trackPendoEvent("vendor_demand_forecast_generated", {
+        stadium_section: userSection,
+        query_text: (query || "").substring(0, 200),
+        tool_calls_count: executedToolCalls.length,
+        results_count: toolCallResultsCount,
+        avg_crowd_density: Math.floor(avgDensity),
+        avg_wait_time: Math.floor(avgWaitTime),
+        gemini_succeeded: geminiSucceeded
+      });
+    } else {
+      trackPendoEvent("fantasy_recommendation_generated", {
+        stadium_section: userSection,
+        query_text: (query || "").substring(0, 200),
+        tool_calls_count: executedToolCalls.length,
+        players_analyzed_count: dbState.game_context[0]?.fantasy_top_players?.length || 0,
+        gemini_succeeded: geminiSucceeded
+      });
+    }
 
     res.json({
       detectedUserType,

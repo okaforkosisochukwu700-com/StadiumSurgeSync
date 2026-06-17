@@ -40,6 +40,14 @@ import {
 import { DBState, LiveEvent, Vendor, PosSale, GameContext, QueryResponse } from "./types";
 import { seedVendors } from "./seedData";
 
+declare global {
+  interface Window {
+    pendo?: {
+      track: (eventName: string, properties?: Record<string, any>) => void;
+    };
+  }
+}
+
 export default function App() {
   // DB & UI States
   const inputRef = useRef<HTMLInputElement>(null);
@@ -81,6 +89,8 @@ export default function App() {
 
   // Reset database state to seeds
   const resetDB = async () => {
+    const prevLiveEventsCount = dbState?.live_events?.length || 0;
+    const prevChatMessagesCount = chatHistory.length;
     try {
       const res = await fetch("/api/db/reset", { method: "POST" });
       if (res.ok) {
@@ -93,6 +103,13 @@ export default function App() {
             text: "🔄 Simulated MongoDB Atlas collections have been reset to default values! Past games pos_sales, current game live_events, and standard matchday vendor catalogs are reloaded.",
           }
         ]);
+
+        // Pendo Track Event: Database reset completed
+        window.pendo?.track("database_reset_completed", {
+          collections_reset: "live_events,vendors,pos_sales,game_context",
+          previous_live_events_count: prevLiveEventsCount,
+          previous_chat_messages_count: prevChatMessagesCount
+        });
       }
     } catch (e) {
       console.error("Error resetting database state:", e);
@@ -108,6 +125,14 @@ export default function App() {
 
     // Add user message to local chat log
     setChatHistory(prev => [...prev, { sender: "user", text: queryText }]);
+
+    // Pendo Track Event: AI query submitted
+    window.pendo?.track("ai_query_submitted", {
+      query_text: queryText.substring(0, 200),
+      stadium_section: userSection,
+      active_role_tab: activeTab,
+      query_length: queryText.length
+    });
 
     try {
       const res = await fetch("/api/query", {
@@ -145,6 +170,16 @@ export default function App() {
           }
         ]);
         
+        // Pendo Track Event: AI query completed successfully
+        window.pendo?.track("ai_query_completed", {
+          detected_user_type: data.detectedUserType,
+          tool_calls_count: data.toolCalls?.length || 0,
+          feedback_loop_triggered: !!data.feedbackLoop,
+          response_text_length: data.responseText?.length || 0,
+          stadium_section: userSection,
+          query_text: queryText.substring(0, 200)
+        });
+
         // Auto select appropriate vendor if they are a vendor querying
         if (data.detectedUserType === "vendor") {
           const matchedVendor = data.updatedDbState?.vendors.find(v => v.section === userSection);
@@ -158,12 +193,30 @@ export default function App() {
           ...prev,
           { sender: "agent", text: `❌ Error querying agent: ${errorData.error || "Unknown server response."}` }
         ]);
+
+        // Pendo Track Event: AI query failed (server error)
+        window.pendo?.track("ai_query_failed", {
+          error_message: String(errorData.error || "Unknown server response.").substring(0, 200),
+          error_type: "server_error",
+          stadium_section: userSection,
+          active_role_tab: activeTab,
+          query_text: queryText.substring(0, 200)
+        });
       }
     } catch (e: any) {
       setChatHistory(prev => [
         ...prev,
         { sender: "agent", text: `❌ Request failed. Ensure the server is running and your GEMINI_API_KEY secret is configured. Error: ${e.message}` }
       ]);
+
+      // Pendo Track Event: AI query failed (network/connection error)
+      window.pendo?.track("ai_query_failed", {
+        error_message: String(e.message || "Unknown").substring(0, 200),
+        error_type: "network_error",
+        stadium_section: userSection,
+        active_role_tab: activeTab,
+        query_text: queryText.substring(0, 200)
+      });
     } finally {
       setQueryLoading(false);
       // scroll query box details into view
@@ -214,6 +267,15 @@ export default function App() {
           }
         ]);
         setShowAdminPanel(false);
+
+        // Pendo Track Event: Manual surge event injected
+        window.pendo?.track("manual_surge_event_injected", {
+          stadium_section: newSection,
+          stand_type: newType,
+          crowd_density: Number(newDensity),
+          wait_time: Number(newWaitTime),
+          event_id: customId
+        });
       }
     } catch (e) {
       console.error("Error inserting manual event:", e);
