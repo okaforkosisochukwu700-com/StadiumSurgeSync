@@ -114,7 +114,7 @@ export default function App() {
     // Track user prompt
     if (typeof pendo !== "undefined") {
       pendo.trackAgent("prompt", {
-        agentId: "f4jc9Wkl469y1V80lKB2SIj5wNM",
+        agentId: "6MF8yJj_J413jq5uaUFqDopsTBQ",
         conversationId: conversationIdRef.current,
         messageId: promptMessageId,
         content: queryText,
@@ -145,10 +145,11 @@ export default function App() {
         // Track agent response
         if (typeof pendo !== "undefined") {
           pendo.trackAgent("agent_response", {
-            agentId: "f4jc9Wkl469y1V80lKB2SIj5wNM",
+            agentId: "6MF8yJj_J413jq5uaUFqDopsTBQ",
             conversationId: conversationIdRef.current,
             messageId: crypto.randomUUID(),
             content: data.responseText,
+            modelUsed: "gemini-3.5-flash",
             toolsUsed: data.toolCalls?.map((tc: any) => tc.tool) || [],
           });
         }
