@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+declare var pendo: { trackAgent: (eventType: string, metadata: object) => void };
+
 import React, { useState, useEffect, useRef } from "react";
 import {
   Search,
@@ -43,6 +45,7 @@ import { seedVendors } from "./seedData";
 export default function App() {
   // DB & UI States
   const inputRef = useRef<HTMLInputElement>(null);
+  const conversationIdRef = useRef(crypto.randomUUID());
   const [dbState, setDbState] = useState<DBState | null>(null);
   const [activeTab, setActiveTab] = useState<"fan" | "vendor" | "fantasy">("fan");
   const [queryInput, setQueryInput] = useState("");
@@ -100,11 +103,24 @@ export default function App() {
   };
 
   // Submit query to StadiumSurgeSync API
-  const submitQuery = async (queryText: string) => {
+  const submitQuery = async (queryText: string, suggestedPrompt = false) => {
     if (queryLoading) return;
     if (!queryText.trim()) return;
     setQueryLoading(true);
     setQueryInput("");
+
+    const promptMessageId = crypto.randomUUID();
+
+    // Track user prompt
+    if (typeof pendo !== "undefined") {
+      pendo.trackAgent("prompt", {
+        agentId: "6MF8yJj_J413jq5uaUFqDopsTBQ",
+        conversationId: conversationIdRef.current,
+        messageId: promptMessageId,
+        content: queryText,
+        suggestedPrompt,
+      });
+    }
 
     // Add user message to local chat log
     setChatHistory(prev => [...prev, { sender: "user", text: queryText }]);
@@ -124,6 +140,18 @@ export default function App() {
         setQueryResult(data);
         if (data.updatedDbState) {
           setDbState(data.updatedDbState);
+        }
+
+        // Track agent response
+        if (typeof pendo !== "undefined") {
+          pendo.trackAgent("agent_response", {
+            agentId: "6MF8yJj_J413jq5uaUFqDopsTBQ",
+            conversationId: conversationIdRef.current,
+            messageId: crypto.randomUUID(),
+            content: data.responseText,
+            modelUsed: "gemini-3.5-flash",
+            toolsUsed: data.toolCalls?.map((tc: any) => tc.tool) || [],
+          });
         }
 
         // Switch to corresponding role tab if the AI detected it
@@ -1167,7 +1195,7 @@ export default function App() {
                       key={index}
                       onClick={() => {
                         if (queryLoading) return;
-                        submitQuery(item.text);
+                        submitQuery(item.text, true);
                       }}
                       disabled={queryLoading}
                       className={`px-2 py-1 bg-zinc-900 text-[10px] text-left border rounded-lg transition font-medium ${
