@@ -220,6 +220,28 @@ async function generateContentWithFallback(ai: GoogleGenAI, params: any): Promis
   throw lastError;
 }
 
+async function pendoTrackServer(event: string, properties: Record<string, any>) {
+  try {
+    await fetch("https://data.pendo.io/data/track", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-pendo-integration-key": "40998916-a56d-4220-bc4e-7e2f5c1efcca"
+      },
+      body: JSON.stringify({
+        type: "track",
+        event,
+        visitorId: "system",
+        accountId: "system",
+        timestamp: Date.now(),
+        properties
+      })
+    });
+  } catch (e) {
+    // Don't let tracking failures break application flow
+  }
+}
+
 async function startServer() {
   // Get in-memory cluster details
   app.get("/api/db", (req, res) => {
@@ -501,6 +523,15 @@ async function startServer() {
         vendorNamesUpdated,
         logInserted
       };
+
+      pendoTrackServer("surge_alert_triggered", {
+        section: userSection,
+        avg_density: Math.floor(avgDensity),
+        vendors_updated_count: vendorNamesUpdated.length,
+        vendor_names_updated: vendorNamesUpdated.join(", ").substring(0, 200),
+        trigger_reason: hasHighDensityEvent ? "high_density_event" : "avg_density_threshold",
+        query_text: (query || "").substring(0, 200)
+      });
     }
 
     // Phase 4: Synthesis response from model or template fallbacks

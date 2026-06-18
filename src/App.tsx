@@ -40,6 +40,16 @@ import {
 import { DBState, LiveEvent, Vendor, PosSale, GameContext, QueryResponse } from "./types";
 import { seedVendors } from "./seedData";
 
+const pendoTrack = (eventName: string, properties: Record<string, any>) => {
+  try {
+    if (typeof window !== 'undefined' && (window as any).pendo) {
+      (window as any).pendo.track(eventName, properties);
+    }
+  } catch (e) {
+    // Don't let tracking failures break application flow
+  }
+};
+
 export default function App() {
   // DB & UI States
   const inputRef = useRef<HTMLInputElement>(null);
@@ -81,6 +91,8 @@ export default function App() {
 
   // Reset database state to seeds
   const resetDB = async () => {
+    const prevLiveEventsCount = dbState?.live_events?.length || 0;
+    const prevVendorsWithAlerts = dbState?.vendors?.filter(v => !!v.alert)?.length || 0;
     try {
       const res = await fetch("/api/db/reset", { method: "POST" });
       if (res.ok) {
@@ -93,6 +105,11 @@ export default function App() {
             text: "🔄 Simulated MongoDB Atlas collections have been reset to default values! Past games pos_sales, current game live_events, and standard matchday vendor catalogs are reloaded.",
           }
         ]);
+
+        pendoTrack("database_reset", {
+          previous_live_events_count: prevLiveEventsCount,
+          previous_vendors_with_alerts_count: prevVendorsWithAlerts
+        });
       }
     } catch (e) {
       console.error("Error resetting database state:", e);
@@ -100,11 +117,18 @@ export default function App() {
   };
 
   // Submit query to StadiumSurgeSync API
-  const submitQuery = async (queryText: string) => {
+  const submitQuery = async (queryText: string, querySource: string = "typed") => {
     if (queryLoading) return;
     if (!queryText.trim()) return;
     setQueryLoading(true);
     setQueryInput("");
+
+    pendoTrack("ai_query_submitted", {
+      query_text: queryText.substring(0, 200),
+      user_section: userSection,
+      active_role: activeTab,
+      query_source: querySource
+    });
 
     // Add user message to local chat log
     setChatHistory(prev => [...prev, { sender: "user", text: queryText }]);
@@ -152,18 +176,41 @@ export default function App() {
             setSelectedVendorId(matchedVendor._id);
           }
         }
+
+        pendoTrack("ai_query_completed", {
+          query_text: queryText.substring(0, 200),
+          user_section: userSection,
+          detected_user_type: data.detectedUserType,
+          tool_calls_count: data.toolCalls?.length || 0,
+          feedback_loop_triggered: !!data.feedbackLoop,
+          response_length: data.responseText?.length || 0
+        });
       } else {
         const errorData = await res.json();
         setChatHistory(prev => [
           ...prev,
           { sender: "agent", text: `❌ Error querying agent: ${errorData.error || "Unknown server response."}` }
         ]);
+        pendoTrack("ai_query_failed", {
+          query_text: queryText.substring(0, 200),
+          user_section: userSection,
+          active_role: activeTab,
+          error_message: (errorData.error || "Unknown server response.").substring(0, 200),
+          error_type: "server_error"
+        });
       }
     } catch (e: any) {
       setChatHistory(prev => [
         ...prev,
         { sender: "agent", text: `❌ Request failed. Ensure the server is running and your GEMINI_API_KEY secret is configured. Error: ${e.message}` }
       ]);
+      pendoTrack("ai_query_failed", {
+        query_text: queryText.substring(0, 200),
+        user_section: userSection,
+        active_role: activeTab,
+        error_message: (e.message || "Unknown error").substring(0, 200),
+        error_type: "network_error"
+      });
     } finally {
       setQueryLoading(false);
       // scroll query box details into view
@@ -205,6 +252,14 @@ export default function App() {
 
       if (res.ok) {
         await fetchDB();
+
+        pendoTrack("manual_surge_event_injected", {
+          section: newSection,
+          stand_type: newType,
+          crowd_density: Number(newDensity),
+          wait_time: Number(newWaitTime)
+        });
+
         // Give visual confirmation
         setChatHistory(prev => [
           ...prev,
@@ -1011,6 +1066,16 @@ export default function App() {
                   href={`https://wa.me/${currentVendor?.whatsapp.replace(/\+/g, "").replace(/\s+/g, "")}`}
                   target="_blank"
                   rel="noreferrer"
+                  onClick={() => {
+                    pendoTrack("whatsapp_supply_request_initiated", {
+                      vendor_id: currentVendor?._id || "",
+                      vendor_name: currentVendor?.name || "",
+                      vendor_section: currentVendor?.section || "",
+                      vendor_type: currentVendor?.type || "",
+                      has_active_alert: !!currentVendor?.alert,
+                      low_stock_item_count: getLowStockCount()
+                    });
+                  }}
                   className="w-full inline-flex py-2.5 bg-[#25D366]/10 hover:bg-[#25D366]/20 border border-[#25D366]/30 hover:border-[#25D366]/50 text-[#25D366] rounded-xl text-center items-center justify-center gap-2 text-xs font-bold transition"
                 >
                   <MessageSquare className="h-4 w-4" />
@@ -1167,7 +1232,7 @@ export default function App() {
                       key={index}
                       onClick={() => {
                         if (queryLoading) return;
-                        submitQuery(item.text);
+                        submitQuery(item.text, "suggestion");
                       }}
                       disabled={queryLoading}
                       className={`px-2 py-1 bg-zinc-900 text-[10px] text-left border rounded-lg transition font-medium ${
